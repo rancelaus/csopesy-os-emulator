@@ -1,5 +1,6 @@
 #include <iostream>
 #include <string>
+#include <cstdlib>
 using namespace std;
 
 // Function prototypes
@@ -48,7 +49,7 @@ void cmdClear() {
 }
 
 void cmdExit() {
-    // TODO: the application/CLI immediately closes
+    exit(0);
 }
 
 // Main program
