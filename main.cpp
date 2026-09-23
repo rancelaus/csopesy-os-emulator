@@ -42,7 +42,9 @@ void cmdReportUtil() {
 }
 
 void cmdClear() {
-    // TODO: the screen clears, reprinting the header texts
+    system("cls");
+    printHeader();
+    cout << "clear command recognized. doing something..." << endl;
 }
 
 void cmdExit() {
