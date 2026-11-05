@@ -185,19 +185,6 @@ void generateInstructions(vector<Instruction> &list, int targetCount,
   }
 }
 
-void dispatchCoresLocked() {
-  for (int coreId = 0; coreId < config.numCpu; ++coreId) {
-    if (!coreCurrentProcess[coreId] && !readyQueue.empty()) {
-      auto p = readyQueue.front();
-      readyQueue.pop_front();
-      p->state = RUNNING;
-      p->assignedCore = coreId;
-      coreCurrentProcess[coreId] = p;
-      coreQuantumRemaining[coreId] = config.quantumCycles;
-    }
-  }
-}
-
 // Creates and registers a new process
 shared_ptr<Process> createProcessLocked(const string &name) {
   for (const auto &existing : allProcesses) {
@@ -278,6 +265,19 @@ void releaseCoreLocked(int coreId, ProcessState nextState) {
   p->state = nextState;
   if (nextState == READY)
     readyQueue.push_back(p);
+}
+
+void dispatchCoresLocked() {
+  for (int coreId = 0; coreId < config.numCpu; ++coreId) {
+    if (!coreCurrentProcess[coreId] && !readyQueue.empty()) {
+      auto p = readyQueue.front();
+      readyQueue.pop_front();
+      p->state = RUNNING;
+      p->assignedCore = coreId;
+      coreCurrentProcess[coreId] = p;
+      coreQuantumRemaining[coreId] = config.quantumCycles;
+    }
+  }
 }
 
 // Dispatch all cores before any worker executes, preventing a process from
@@ -432,6 +432,7 @@ struct SchedulerSnapshot {
 
 SchedulerSnapshot getSchedulerSnapshot() {
   lock_guard<mutex> lock(schedulerMutex);
+  dispatchCoresLocked();
   SchedulerSnapshot result;
   result.ticks = cpuTicks;
   result.totalCores = config.numCpu;
