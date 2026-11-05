@@ -13,6 +13,10 @@
 #include <iomanip>
 #include <algorithm>
 #include <cstdlib>
+#include <condition_variable>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
 
 using namespace std;
 
@@ -64,24 +68,34 @@ struct Process {
     // Simulated 16-bit registers/variables clamped to [0, 65535]
     uint16_t varA = 0;
     vector<string> logs;
-    uint8_t sleepRemaining = 0;
+    uint64_t wakeTick = 0;
+    uint64_t executionDelayRemaining = 0; // persists across RR preemption
 
     Process(int id, string pName) : pid(id), name(pName), state(READY), currentLine(0) {}
 };
 
-// Global flags and synchronization
+// All scheduler, queue, core, and mutable process data use this one mutex.
+// Functions ending in Locked require the caller to hold schedulerMutex.
 atomic<bool> isInitialized(false);
 atomic<bool> isRunning(true);
-atomic<bool> schedulerGenerating(false);
+bool schedulerGenerating = false;
+mutex schedulerMutex;
+condition_variable tickReady;
+condition_variable tickComplete;
+condition_variable clockWake;
 
 deque<shared_ptr<Process>> readyQueue;
 vector<shared_ptr<Process>> allProcesses;
-mutex processMutex; // protects readyQueue and allProcesses
-
-// Keeps track of what each core is doing
 vector<shared_ptr<Process>> coreCurrentProcess;
-vector<int> coreQuantumRemaining;
-mutex coreMutex;
+vector<uint64_t> coreQuantumRemaining;
+vector<thread> coreWorkers;
+thread clockThread;
+
+uint64_t cpuTicks = 0;
+uint64_t batchTimer = 0;
+size_t pendingCores = 0;
+bool tickInProgress = false;
+const chrono::milliseconds CPU_TICK_INTERVAL(10); // wall-clock pacing only
 
 int nextPid = 1;
 int processCounter = 1;
@@ -102,7 +116,11 @@ string getCurrentTimestamp() {
     char buffer[80];
 
     time(&rawtime);
-    timeinfo = localtime(&rawtime);
+    // Keep C++11 compatibility with older MinGW distributions.
+    static mutex timestampMutex;
+    lock_guard<mutex> lock(timestampMutex);
+    struct tm localTime = *localtime(&rawtime);
+    timeinfo = &localTime;
     strftime(buffer, sizeof(buffer), "(%m/%d/%Y %I:%M:%S%p)", timeinfo);
     return string(buffer);
 }
@@ -138,11 +156,14 @@ void generateInstructions(vector<Instruction>& list, int targetCount, int depth 
 }
 
 // Creates and registers a new process, then pushes it to the ready queue
-shared_ptr<Process> createProcess(string name) {
-    lock_guard<mutex> lock(processMutex);
+shared_ptr<Process> createProcessLocked(const string& name) {
+    for (const auto& existing : allProcesses) {
+        if (existing->name == name) return nullptr;
+    }
 
     auto p = make_shared<Process>(nextPid++, name);
     p->startTime = getCurrentTimestamp();
+    p->executionDelayRemaining = config.delaysPerExec;
 
     // Pick random instruction count based on config settings
     int lineRange = config.maxIns - config.minIns + 1;
@@ -154,6 +175,11 @@ shared_ptr<Process> createProcess(string name) {
     allProcesses.push_back(p);
     readyQueue.push_back(p);
     return p;
+}
+
+shared_ptr<Process> createProcess(const string& name) {
+    lock_guard<mutex> lock(schedulerMutex);
+    return createProcessLocked(name);
 }
 
 // Executes one instruction for a process on a specific core
@@ -179,124 +205,181 @@ void runInstruction(shared_ptr<Process>& p, Instruction& ins, int coreId) {
             else p->varA -= 2;
             break;
         case INS_SLEEP:
-            p->sleepRemaining = ins.sleepTicks;
+            // Even SLEEP(0) yields until the next tick; no same-tick redispatch.
+            p->wakeTick = cpuTicks + max<uint64_t>(1, ins.sleepTicks);
             p->state = WAITING_SLEEP;
             break;
     }
 }
 
-// Worker thread for each simulated CPU core
-void cpuCoreWorker(int coreId) {
-    while (isRunning) {
-        shared_ptr<Process> p = nullptr;
+// Release ownership before making a process visible in the ready queue.
+void releaseCoreLocked(int coreId, ProcessState nextState) {
+    auto p = coreCurrentProcess[coreId];
+    coreCurrentProcess[coreId].reset();
+    coreQuantumRemaining[coreId] = 0;
+    p->assignedCore = -1;
+    p->state = nextState;
+    if (nextState == READY) readyQueue.push_back(p);
+}
 
-        // Try getting a process from the ready queue
-        {
-            lock_guard<mutex> lock(processMutex);
-            if (!readyQueue.empty()) {
-                p = readyQueue.front();
-                readyQueue.pop_front();
-                p->state = RUNNING;
-                p->assignedCore = coreId;
-            }
+// Dispatch all cores before any worker executes, preventing a process from
+// migrating to another core and executing twice in the same global tick.
+void beginTickLocked() {
+    ++cpuTicks;
+    for (const auto& p : allProcesses) {
+        if (p->state == WAITING_SLEEP && cpuTicks >= p->wakeTick) {
+            p->state = READY;
+            readyQueue.push_back(p);
         }
-
-        {
-            lock_guard<mutex> cLock(coreMutex);
+    }
+    for (int coreId = 0; coreId < config.numCpu; ++coreId) {
+        if (!coreCurrentProcess[coreId] && !readyQueue.empty()) {
+            auto p = readyQueue.front();
+            readyQueue.pop_front();
+            p->state = RUNNING;
+            p->assignedCore = coreId;
             coreCurrentProcess[coreId] = p;
             coreQuantumRemaining[coreId] = config.quantumCycles;
-        }
-
-        // Nothing to run right now, wait a bit
-        if (p == nullptr) {
-            this_thread::sleep_for(chrono::milliseconds(5));
-            continue;
-        }
-
-        // Keep executing while process is on this core
-        while (isRunning && p->state == RUNNING) {
-            // Check for busy-waiting delay
-            if (config.delaysPerExec > 0) {
-                this_thread::sleep_for(chrono::milliseconds(config.delaysPerExec));
-            }
-
-            // Execute the current line
-            if (p->currentLine < p->totalInstructions) {
-                runInstruction(p, p->instructions[p->currentLine], coreId);
-                p->currentLine++;
-            }
-
-            // Check if process finished all lines
-            if (p->currentLine >= p->totalInstructions) {
-                p->state = FINISHED;
-                break;
-            }
-
-            // If it put itself to sleep, let go of core
-            if (p->state == WAITING_SLEEP) {
-                break;
-            }
-
-            // Handle Round-Robin time slicing
-            if (config.scheduler == "rr") {
-                lock_guard<mutex> cLock(coreMutex);
-                coreQuantumRemaining[coreId]--;
-
-                if (coreQuantumRemaining[coreId] <= 0) {
-                    // Quantum expired, move back to ready queue
-                    p->state = READY;
-                    lock_guard<mutex> lock(processMutex);
-                    readyQueue.push_back(p);
-                    break;
-                }
-            }
-
-            this_thread::sleep_for(chrono::milliseconds(1));
-        }
-
-        // Release the core
-        {
-            lock_guard<mutex> cLock(coreMutex);
-            coreCurrentProcess[coreId] = nullptr;
         }
     }
 }
 
-// Background thread that ticks clock, wakes up sleepers, and generates batch processes
-void clockTicker() {
-    uint32_t batchTimer = 0;
-
-    while (isRunning) {
-        this_thread::sleep_for(chrono::milliseconds(10));
-        if (!isInitialized) continue;
-
-        // Wake up sleeping processes
-        {
-            lock_guard<mutex> lock(processMutex);
-            for (auto& p : allProcesses) {
-                if (p->state == WAITING_SLEEP) {
-                    if (p->sleepRemaining > 0) {
-                        p->sleepRemaining--;
-                    }
-                    if (p->sleepRemaining == 0) {
-                        p->state = READY;
-                        readyQueue.push_back(p);
-                    }
-                }
-            }
+// One occupied CPU cycle. Delays retain the core and count toward RR time.
+void executeCoreTickLocked(int coreId) {
+    auto p = coreCurrentProcess[coreId];
+    if (!p) return;
+    if (p->executionDelayRemaining > 0) {
+        --p->executionDelayRemaining;
+    } else {
+        if (p->currentLine < p->totalInstructions) {
+            runInstruction(p, p->instructions[p->currentLine], coreId);
+            ++p->currentLine;
         }
-
-        // Automatically spawn processes if scheduler-start is active
-        if (schedulerGenerating) {
-            batchTimer++;
-            if (batchTimer >= config.batchProcessFreq) {
-                batchTimer = 0;
-                stringstream ss;
-                ss << "p" << setfill('0') << setw(2) << processCounter++;
-                createProcess(ss.str());
-            }
-        }
+        p->executionDelayRemaining = config.delaysPerExec;
     }
+
+    if (p->currentLine >= p->totalInstructions) {
+        releaseCoreLocked(coreId, FINISHED);
+    } else if (p->state == WAITING_SLEEP) {
+        releaseCoreLocked(coreId, WAITING_SLEEP);
+    } else if (config.scheduler == "rr" && --coreQuantumRemaining[coreId] == 0) {
+        releaseCoreLocked(coreId, READY);
+    }
+}
+
+// Generation occurs at the END of each configured number of global cycles.
+void finishTickLocked() {
+    if (!schedulerGenerating || ++batchTimer < config.batchProcessFreq) return;
+    batchTimer = 0;
+    shared_ptr<Process> created;
+    do {
+        stringstream name;
+        name << "p" << setfill('0') << setw(2) << processCounter++;
+        created = createProcessLocked(name.str());
+    } while (!created); // skip names already used by manually created processes
+}
+
+void cpuCoreWorker(int coreId) {
+    uint64_t lastTick = 0;
+    unique_lock<mutex> lock(schedulerMutex);
+    while (true) {
+        tickReady.wait(lock, [&] {
+            return !isRunning || (tickInProgress && cpuTicks != lastTick);
+        });
+        if (!isRunning) return;
+        lastTick = cpuTicks;
+        executeCoreTickLocked(coreId);
+        if (--pendingCores == 0) tickComplete.notify_one();
+    }
+}
+
+void clockTicker() {
+    unique_lock<mutex> lock(schedulerMutex);
+    while (isRunning) {
+        // Wall time merely paces the emulator. All behavior uses cpuTicks.
+        if (clockWake.wait_for(lock, CPU_TICK_INTERVAL, [] { return !isRunning; })) break;
+        beginTickLocked();
+        pendingCores = coreWorkers.size();
+        tickInProgress = true;
+        tickReady.notify_all();
+        tickComplete.wait(lock, [] { return !isRunning || pendingCores == 0; });
+        tickInProgress = false;
+        if (!isRunning) break;
+        finishTickLocked();
+    }
+}
+
+void setSchedulerGenerating(bool enabled) {
+    lock_guard<mutex> lock(schedulerMutex);
+    // Repeated start is idempotent; a fresh start waits a complete interval.
+    if (enabled && !schedulerGenerating) batchTimer = 0;
+    schedulerGenerating = enabled;
+    if (!enabled) batchTimer = 0;
+}
+
+void shutdownScheduler() {
+    {
+        lock_guard<mutex> lock(schedulerMutex);
+        isRunning = false;
+        schedulerGenerating = false;
+    }
+    tickReady.notify_all();
+    tickComplete.notify_all();
+    clockWake.notify_all();
+    if (clockThread.joinable()) clockThread.join();
+    for (auto& worker : coreWorkers) {
+        if (worker.joinable()) worker.join();
+    }
+    coreWorkers.clear();
+}
+
+struct ProcessSnapshot {
+    int pid;
+    string name;
+    ProcessState state;
+    int currentLine;
+    int totalInstructions;
+    int assignedCore;
+    string startTime;
+    vector<string> logs;
+};
+
+ProcessSnapshot snapshotProcessLocked(const shared_ptr<Process>& p, bool includeLogs) {
+    ProcessSnapshot result;
+    result.pid = p->pid;
+    result.name = p->name;
+    result.state = p->state;
+    result.currentLine = p->currentLine;
+    result.totalInstructions = p->totalInstructions;
+    result.assignedCore = p->assignedCore;
+    result.startTime = p->startTime;
+    if (includeLogs) result.logs = p->logs;
+    return result;
+}
+
+ProcessSnapshot getProcessSnapshot(const shared_ptr<Process>& p) {
+    lock_guard<mutex> lock(schedulerMutex);
+    return snapshotProcessLocked(p, true);
+}
+
+struct SchedulerSnapshot {
+    uint64_t ticks;
+    int totalCores;
+    int usedCores;
+    vector<ProcessSnapshot> processes;
+};
+
+SchedulerSnapshot getSchedulerSnapshot() {
+    lock_guard<mutex> lock(schedulerMutex);
+    SchedulerSnapshot result;
+    result.ticks = cpuTicks;
+    result.totalCores = config.numCpu;
+    result.usedCores = 0;
+    for (const auto& p : coreCurrentProcess) if (p) ++result.usedCores;
+    for (const auto& p : allProcesses) {
+        result.processes.push_back(snapshotProcessLocked(p, false));
+    }
+    return result;
 }
 
 // Reads config.txt settings
@@ -325,17 +408,11 @@ void loadConfig(const string& filename) {
 // Builds the summary report used by both "screen -ls" and "report-util"
 string buildReport() {
     stringstream out;
-    int usedCores = 0;
-
-    {
-        lock_guard<mutex> lock(coreMutex);
-        for (int i = 0; i < config.numCpu; i++) {
-            if (coreCurrentProcess[i] != nullptr) usedCores++;
-        }
-    }
-
-    int freeCores = config.numCpu - usedCores;
-    double utilRate = (config.numCpu > 0) ? ((double)usedCores / config.numCpu) * 100.0 : 0.0;
+    const auto snapshot = getSchedulerSnapshot();
+    const int usedCores = snapshot.usedCores;
+    const int freeCores = snapshot.totalCores - usedCores;
+    const double utilRate = snapshot.totalCores > 0
+        ? 100.0 * usedCores / snapshot.totalCores : 0.0;
 
     out << "CPU utilization: " << (int)utilRate << "%\n";
     out << "Cores used: " << usedCores << "\n";
@@ -343,22 +420,21 @@ string buildReport() {
 
     out << "Running processes:\n";
     {
-        lock_guard<mutex> lock(processMutex);
-        for (const auto& p : allProcesses) {
-            if (p->state != FINISHED) {
-                out << left << setw(12) << p->name
-                    << " " << p->startTime
-                    << " Core: " << (p->assignedCore != -1 ? to_string(p->assignedCore) : "None")
-                    << "\t" << p->currentLine << " / " << p->totalInstructions << "\n";
+        for (const auto& p : snapshot.processes) {
+            if (p.state != FINISHED) {
+                out << left << setw(12) << p.name
+                    << " " << p.startTime
+                    << " Core: " << (p.assignedCore != -1 ? to_string(p.assignedCore) : "None")
+                    << "\t" << p.currentLine << " / " << p.totalInstructions << "\n";
             }
         }
 
         out << "\nFinished processes:\n";
-        for (const auto& p : allProcesses) {
-            if (p->state == FINISHED) {
-                out << left << setw(12) << p->name
-                    << " " << p->startTime
-                    << " Finished\t" << p->totalInstructions << " / " << p->totalInstructions << "\n";
+        for (const auto& p : snapshot.processes) {
+            if (p.state == FINISHED) {
+                out << left << setw(12) << p.name
+                    << " " << p.startTime
+                    << " Finished\t" << p.totalInstructions << " / " << p.totalInstructions << "\n";
             }
         }
     }
@@ -369,6 +445,9 @@ string buildReport() {
 // Process screen submenu (handles process-smi and exit)
 void openProcessScreen(shared_ptr<Process> p) {
     clearScreen();
+    cout << "Process: " << p->name << "\n\n";
+    cout << "  process-smi  Show process details, logs, and progress\n";
+    cout << "  exit         Return to the main menu\n\n";
     string cmd;
 
     while (true) {
@@ -382,19 +461,20 @@ void openProcessScreen(shared_ptr<Process> p) {
         cmd = cmd.substr(start, end - start + 1);
 
         if (cmd == "process-smi") {
-            cout << "Process name: " << p->name << "\n";
-            cout << "ID: " << p->pid << "\n\n";
+            const auto snapshot = getProcessSnapshot(p);
+            cout << "Process name: " << snapshot.name << "\n";
+            cout << "ID: " << snapshot.pid << "\n\n";
             cout << "Logs:\n";
 
-            for (const auto& log : p->logs) {
+            for (const auto& log : snapshot.logs) {
                 cout << log << "\n";
             }
 
-            if (p->state == FINISHED) {
+            if (snapshot.state == FINISHED) {
                 cout << "\nFinished!\n\n";
             } else {
-                cout << "\nCurrent instruction line: " << p->currentLine << "\n";
-                cout << "Lines of code: " << p->totalInstructions << "\n\n";
+                cout << "\nCurrent instruction line: " << snapshot.currentLine << "\n";
+                cout << "Lines of code: " << snapshot.totalInstructions << "\n\n";
             }
         } else if (cmd == "exit") {
             clearScreen();
@@ -426,18 +506,45 @@ void cmdInitialize() {
 
     loadConfig("config.txt");
 
-    // Allocate core tracking slots
-    coreCurrentProcess.assign(config.numCpu, nullptr);
-    coreQuantumRemaining.assign(config.numCpu, config.quantumCycles);
-
-    // Spin up thread workers for the cores
-    for (int i = 0; i < config.numCpu; i++) {
-        thread(cpuCoreWorker, i).detach();
+    // Minimum scheduler guards; full config parsing/validation belongs to the CLI work.
+    if (config.numCpu < 1 || config.numCpu > 128 ||
+        (config.scheduler != "fcfs" && config.scheduler != "rr") ||
+        config.quantumCycles == 0 || config.batchProcessFreq == 0 ||
+        config.minIns == 0 || config.maxIns < config.minIns ||
+        config.maxIns > static_cast<uint32_t>(numeric_limits<int>::max())) {
+        cout << "Invalid scheduler configuration; initialization cancelled.\n";
+        return;
     }
 
+    coreCurrentProcess.assign(config.numCpu, nullptr);
+    coreQuantumRemaining.assign(config.numCpu, config.quantumCycles);
+    try {
+        for (int i = 0; i < config.numCpu; ++i) {
+            coreWorkers.emplace_back(cpuCoreWorker, i);
+        }
+        clockThread = thread(clockTicker);
+    } catch (const exception& error) {
+        shutdownScheduler();
+        isRunning = true; // allow retry after all partially started threads are joined
+        cout << "Unable to start scheduler: " << error.what() << "\n";
+        return;
+    }
     isInitialized = true;
     cout << "System initialized successfully with " << config.numCpu 
          << " CPU cores. Scheduler: " << config.scheduler << ".\n";
+    cout << "\nMain menu commands:\n";
+    cout << "  screen -s <name>  Create a process and open its screen\n";
+    cout << "  screen -r <name>  Reopen an unfinished process screen\n";
+    cout << "  screen -ls        Show CPU usage and process summaries\n";
+    cout << "  scheduler-start   Start automatic process generation\n";
+    cout << "  scheduler-stop    Stop generation; existing processes continue\n";
+    cout << "  report-util       Save a report to csopesy-log.txt\n";
+    cout << "  clear             Clear the console\n";
+    cout << "  exit              Close the emulator\n";
+    cout << "\nInside a process screen:\n";
+    cout << "  process-smi       Show process details, logs, and progress\n";
+    cout << "  exit              Return to the main menu\n";
+
 }
 
 // Parses and routes "screen" subcommands (-s, -r, -ls)
@@ -457,7 +564,7 @@ void cmdScreen(const string& fullCommand) {
         // Check if name already in use
         shared_ptr<Process> target = nullptr;
         {
-            lock_guard<mutex> lock(processMutex);
+            lock_guard<mutex> lock(schedulerMutex);
             for (auto& p : allProcesses) {
                 if (p->name == name) {
                     target = p;
@@ -472,6 +579,10 @@ void cmdScreen(const string& fullCommand) {
         }
 
         target = createProcess(name);
+        if (!target) {
+            cout << "Process " << name << " already exists!\n";
+            return;
+        }
         openProcessScreen(target);
     } else if (flag == "-r") {
         if (name.empty()) {
@@ -481,7 +592,7 @@ void cmdScreen(const string& fullCommand) {
 
         shared_ptr<Process> target = nullptr;
         {
-            lock_guard<mutex> lock(processMutex);
+            lock_guard<mutex> lock(schedulerMutex);
             for (auto& p : allProcesses) {
                 if (p->name == name) {
                     target = p;
@@ -491,7 +602,7 @@ void cmdScreen(const string& fullCommand) {
         }
 
         // Cannot re-enter a finished or missing process
-        if (target == nullptr || target->state == FINISHED) {
+        if (target == nullptr || getProcessSnapshot(target).state == FINISHED) {
             cout << "Process " << name << " not found.\n";
             return;
         }
@@ -515,9 +626,6 @@ void cmdReportUtil() {
 
 int main() {
     srand((unsigned int)time(NULL));
-
-    // Start background clock thread
-    thread(clockTicker).detach();
 
     printHeader();
 
@@ -563,10 +671,10 @@ int main() {
         } else if (command == "screen") {
             cmdScreen(input);
         } else if (command == "scheduler-start") {
-            schedulerGenerating = true;
+            setSchedulerGenerating(true);
             cout << "Dummy process generation started.\n";
         } else if (command == "scheduler-stop") {
-            schedulerGenerating = false;
+            setSchedulerGenerating(false);
             cout << "Dummy process generation stopped.\n";
         } else if (command == "report-util") {
             cmdReportUtil();
@@ -575,5 +683,6 @@ int main() {
         }
     }
 
+    shutdownScheduler();
     return 0;
 }
