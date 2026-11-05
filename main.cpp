@@ -101,6 +101,9 @@ const chrono::milliseconds CPU_TICK_INTERVAL(10); // Wall-clock pacing
 int nextPid = 1;
 int processCounter = 1;
 
+// Forward declaration
+void dispatchCoresLocked();
+
 // Clears the terminal screen
 void clearScreen() {
 #ifdef _WIN32
@@ -534,6 +537,7 @@ void renderProcessSmi(const shared_ptr<Process> &p) {
 // Attached process screen sub-shell
 void openProcessScreen(shared_ptr<Process> p) {
   clearScreen();
+  // Render process status upon entering the screen
   renderProcessSmi(p);
 
   string cmd;
