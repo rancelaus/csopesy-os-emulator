@@ -70,8 +70,7 @@ struct Process {
   map<string, uint16_t> variables;
   vector<string> logs;
   uint64_t wakeTick = 0;
-  uint64_t executionDelayRemaining =
-      0; // delay remaining before next instruction
+  uint64_t executionDelayRemaining = 0;
 
   Process(int id, string pName)
       : pid(id), name(pName), state(READY), currentLine(0) {}
@@ -135,8 +134,7 @@ static string randomVarName() {
 void generateInstructions(vector<Instruction> &list, int targetCount,
                           int depth = 0) {
   while ((int)list.size() < targetCount) {
-    int roll = rand() %
-               6; // 0: print, 1: declare, 2: add, 3: sub, 4: sleep, 5: for-loop
+    int roll = rand() % 6; // 0: print, 1: declare, 2: add, 3: sub, 4: sleep, 5: for-loop
 
     if (roll == 5 && depth < 3) {
       int repeats = 2 + (rand() % 3);
@@ -150,7 +148,6 @@ void generateInstructions(vector<Instruction> &list, int targetCount,
       Instruction ins;
       if (roll == 0 || roll == 5) {
         ins.type = INS_PRINT;
-        // can print a variable or "Hello world from <name>!" (Default)
         if (rand() % 3 == 0) {
           ins.printVariable = true;
           ins.var1 = randomVarName();
@@ -188,6 +185,19 @@ void generateInstructions(vector<Instruction> &list, int targetCount,
   }
 }
 
+void dispatchCoresLocked() {
+  for (int coreId = 0; coreId < config.numCpu; ++coreId) {
+    if (!coreCurrentProcess[coreId] && !readyQueue.empty()) {
+      auto p = readyQueue.front();
+      readyQueue.pop_front();
+      p->state = RUNNING;
+      p->assignedCore = coreId;
+      coreCurrentProcess[coreId] = p;
+      coreQuantumRemaining[coreId] = config.quantumCycles;
+    }
+  }
+}
+
 // Creates and registers a new process
 shared_ptr<Process> createProcessLocked(const string &name) {
   for (const auto &existing : allProcesses) {
@@ -197,8 +207,6 @@ shared_ptr<Process> createProcessLocked(const string &name) {
 
   auto p = make_shared<Process>(nextPid++, name);
   p->startTime = getCurrentTimestamp();
-  // Instruction 0 runs immediately without delay, following instructions
-  // observe delaysPerExec
   p->executionDelayRemaining = 0;
 
   int lineRange = config.maxIns - config.minIns + 1;
@@ -210,6 +218,7 @@ shared_ptr<Process> createProcessLocked(const string &name) {
 
   allProcesses.push_back(p);
   readyQueue.push_back(p);
+  dispatchCoresLocked();
   return p;
 }
 
@@ -269,19 +278,6 @@ void releaseCoreLocked(int coreId, ProcessState nextState) {
   p->state = nextState;
   if (nextState == READY)
     readyQueue.push_back(p);
-}
-
-void dispatchCoresLocked() {
-  for (int coreId = 0; coreId < config.numCpu; ++coreId) {
-    if (!coreCurrentProcess[coreId] && !readyQueue.empty()) {
-      auto p = readyQueue.front();
-      readyQueue.pop_front();
-      p->state = RUNNING;
-      p->assignedCore = coreId;
-      coreCurrentProcess[coreId] = p;
-      coreQuantumRemaining[coreId] = config.quantumCycles;
-    }
-  }
 }
 
 // Dispatch all cores before any worker executes, preventing a process from
@@ -537,7 +533,6 @@ void renderProcessSmi(const shared_ptr<Process> &p) {
 // Attached process screen sub-shell
 void openProcessScreen(shared_ptr<Process> p) {
   clearScreen();
-  // Render process status upon entering the screen
   renderProcessSmi(p);
 
   string cmd;
@@ -666,7 +661,6 @@ void cmdScreen(const string &fullCommand) {
       }
     }
 
-    // If process not found or finished, print: "Process <name> not found."
     if (target == nullptr || getProcessSnapshot(target).state == FINISHED) {
       cout << "Process " << name << " not found.\n";
       return;
@@ -733,8 +727,7 @@ int main() {
       cmdInitialize();
     } else if (command == "screen") {
       cmdScreen(input);
-    } else if (command ==
-               "screen-ls") { // Support both screen -ls and screen-ls
+    } else if (command == "screen-ls") {
       cout << buildReport();
     } else if (command == "scheduler-start" || command == "scheduler-test") {
       setSchedulerGenerating(true);
