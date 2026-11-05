@@ -271,16 +271,7 @@ void releaseCoreLocked(int coreId, ProcessState nextState) {
     readyQueue.push_back(p);
 }
 
-// Dispatch all cores before any worker executes, preventing a process from
-// migrating to another core and executing twice in the same global tick.
-void beginTickLocked() {
-  ++cpuTicks;
-  for (const auto &p : allProcesses) {
-    if (p->state == WAITING_SLEEP && cpuTicks >= p->wakeTick) {
-      p->state = READY;
-      readyQueue.push_back(p);
-    }
-  }
+void dispatchCoresLocked() {
   for (int coreId = 0; coreId < config.numCpu; ++coreId) {
     if (!coreCurrentProcess[coreId] && !readyQueue.empty()) {
       auto p = readyQueue.front();
@@ -291,6 +282,19 @@ void beginTickLocked() {
       coreQuantumRemaining[coreId] = config.quantumCycles;
     }
   }
+}
+
+// Dispatch all cores before any worker executes, preventing a process from
+// migrating to another core and executing twice in the same global tick.
+void beginTickLocked() {
+  ++cpuTicks;
+  for (const auto &p : allProcesses) {
+    if (p->state == WAITING_SLEEP && cpuTicks >= p->wakeTick) {
+      p->state = READY;
+      readyQueue.push_back(p);
+    }
+  }
+  dispatchCoresLocked();
 }
 
 // Executes an occupied core cycle
@@ -320,15 +324,16 @@ void executeCoreTickLocked(int coreId) {
 
 // Generation occurs at the END of each configured number of global cycles.
 void finishTickLocked() {
-  if (!schedulerGenerating || ++batchTimer < config.batchProcessFreq)
-    return;
-  batchTimer = 0;
-  shared_ptr<Process> created;
-  do {
-    stringstream name;
-    name << "p" << setfill('0') << setw(2) << processCounter++;
-    created = createProcessLocked(name.str());
-  } while (!created);
+  if (schedulerGenerating && ++batchTimer >= config.batchProcessFreq) {
+    batchTimer = 0;
+    shared_ptr<Process> created;
+    do {
+      stringstream name;
+      name << "p" << setfill('0') << setw(2) << processCounter++;
+      created = createProcessLocked(name.str());
+    } while (!created);
+  }
+  dispatchCoresLocked();
 }
 
 void cpuCoreWorker(int coreId) {
