@@ -96,7 +96,7 @@ uint64_t cpuTicks = 0;
 uint64_t batchTimer = 0;
 size_t pendingCores = 0;
 bool tickInProgress = false;
-const chrono::milliseconds CPU_TICK_INTERVAL(10); // Wall-clock pacing
+const chrono::milliseconds CPU_TICK_INTERVAL(1); // Wall-clock pacing
 
 int nextPid = 1;
 int processCounter = 1;
@@ -353,18 +353,34 @@ void cpuCoreWorker(int coreId) {
 
 void clockTicker() {
   unique_lock<mutex> lock(schedulerMutex);
+  auto lastGenTime = chrono::steady_clock::now();
+
   while (isRunning) {
-    if (clockWake.wait_for(lock, CPU_TICK_INTERVAL, [] { return !isRunning; }))
+    bool hasWork = !readyQueue.empty();
+    for (const auto& cp : coreCurrentProcess) {
+      if (cp) { hasWork = true; break; }
+    }
+
+    auto sleepDuration = hasWork ? chrono::microseconds(100) : chrono::milliseconds(10);
+    if (clockWake.wait_for(lock, sleepDuration, [] { return !isRunning; }))
       break;
+
     beginTickLocked();
     pendingCores = coreWorkers.size();
     tickInProgress = true;
     tickReady.notify_all();
     tickComplete.wait(lock, [] { return !isRunning || pendingCores == 0; });
     tickInProgress = false;
-    if (!isRunning)
-      break;
-    finishTickLocked();
+    if (!isRunning) break;
+
+    // Pace process generation to ~1 batch per second when scheduler-test is on
+    auto now = chrono::steady_clock::now();
+    if (schedulerGenerating && chrono::duration_cast<chrono::milliseconds>(now - lastGenTime).count() >= 1000) {
+      lastGenTime = now;
+      finishTickLocked();
+    } else {
+      dispatchCoresLocked();
+    }
   }
 }
 
