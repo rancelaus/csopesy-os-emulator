@@ -12,6 +12,7 @@
 #include <ctime>
 #include <iomanip>
 #include <algorithm>
+#include <map>
 #include <cstdlib>
 #include <condition_variable>
 #include <cstdint>
@@ -43,7 +44,11 @@ enum InstructionType {
 // Represents an individual instruction line
 struct Instruction {
     InstructionType type;
-    uint8_t sleepTicks = 0; // used only if type is INS_SLEEP
+    uint8_t sleepTicks = 0;    // used only if type is INS_SLEEP
+    string var1, var2, var3;   // variable names for DECLARE/ADD/SUBTRACT
+    uint16_t val1 = 0, val2 = 0, val3 = 0; // immediate values
+    bool isVal2Immediate = false;
+    bool isVal3Immediate = false;
 };
 
 // Possible states a process can be in
@@ -65,8 +70,8 @@ struct Process {
     int assignedCore = -1;
     string startTime;
 
-    // Simulated 16-bit registers/variables clamped to [0, 65535]
-    uint16_t varA = 0;
+    // Per-process named variable store; uint16 values clamped to [0, 65535]
+    map<string, uint16_t> variables;
     vector<string> logs;
     uint64_t wakeTick = 0;
     uint64_t executionDelayRemaining = 0; // persists across RR preemption
@@ -125,6 +130,12 @@ string getCurrentTimestamp() {
     return string(buffer);
 }
 
+// Helper: generates a random variable name from a small pool
+static string randomVarName() {
+    static const char* pool[] = {"x","y","z","a","b","c","d","e","f","g"};
+    return pool[rand() % 10];
+}
+
 // Generates instructions for a process
 // Flattens loops directly into the instruction array (loops can nest up to 3 times)
 void generateInstructions(vector<Instruction>& list, int targetCount, int depth = 0) {
@@ -142,11 +153,33 @@ void generateInstructions(vector<Instruction>& list, int targetCount, int depth 
             }
         } else {
             Instruction ins;
-            if (roll == 0 || roll == 5) ins.type = INS_PRINT;
-            else if (roll == 1) ins.type = INS_DECLARE;
-            else if (roll == 2) ins.type = INS_ADD;
-            else if (roll == 3) ins.type = INS_SUBTRACT;
-            else if (roll == 4) {
+            if (roll == 0 || roll == 5) {
+                ins.type = INS_PRINT;
+            } else if (roll == 1) {
+                ins.type = INS_DECLARE;
+                ins.var1 = randomVarName();
+                ins.val1 = (uint16_t)(rand() % 100);
+            } else if (roll == 2) {
+                ins.type = INS_ADD;
+                ins.var1 = randomVarName();
+                ins.var2 = randomVarName();
+                if (rand() % 2 == 0) {
+                    ins.var3 = randomVarName();
+                } else {
+                    ins.isVal3Immediate = true;
+                    ins.val3 = (uint16_t)(rand() % 50);
+                }
+            } else if (roll == 3) {
+                ins.type = INS_SUBTRACT;
+                ins.var1 = randomVarName();
+                ins.var2 = randomVarName();
+                if (rand() % 2 == 0) {
+                    ins.var3 = randomVarName();
+                } else {
+                    ins.isVal3Immediate = true;
+                    ins.val3 = (uint16_t)(rand() % 50);
+                }
+            } else if (roll == 4) {
                 ins.type = INS_SLEEP;
                 ins.sleepTicks = 1 + (rand() % 5);
             }
@@ -193,17 +226,25 @@ void runInstruction(shared_ptr<Process>& p, Instruction& ins, int coreId) {
             break;
         }
         case INS_DECLARE:
-            p->varA = 10;
+            // DECLARE(var, value) — store named uint16 variable
+            p->variables[ins.var1] = ins.val1;
             break;
-        case INS_ADD:
-            // uint16 clamping [0, 65535]
-            if ((int)p->varA + 5 > 65535) p->varA = 65535;
-            else p->varA += 5;
+        case INS_ADD: {
+            // ADD(var1, var2/value, var3/value) — var1 = var2/value + var3/value, clamped [0, 65535]
+            uint32_t op2 = ins.isVal2Immediate ? ins.val2 : p->variables[ins.var2];
+            uint32_t op3 = ins.isVal3Immediate ? ins.val3 : p->variables[ins.var3];
+            uint32_t sum = op2 + op3;
+            p->variables[ins.var1] = (sum > 65535) ? (uint16_t)65535 : (uint16_t)sum;
             break;
-        case INS_SUBTRACT:
-            if ((int)p->varA - 2 < 0) p->varA = 0;
-            else p->varA -= 2;
+        }
+        case INS_SUBTRACT: {
+            // SUBTRACT(var1, var2/value, var3/value) — var1 = var2/value - var3/value, clamped [0, 65535]
+            int32_t op2 = ins.isVal2Immediate ? (int32_t)ins.val2 : (int32_t)p->variables[ins.var2];
+            int32_t op3 = ins.isVal3Immediate ? (int32_t)ins.val3 : (int32_t)p->variables[ins.var3];
+            int32_t diff = op2 - op3;
+            p->variables[ins.var1] = (diff < 0) ? (uint16_t)0 : (uint16_t)diff;
             break;
+        }
         case INS_SLEEP:
             // Even SLEEP(0) yields until the next tick; no same-tick redispatch.
             p->wakeTick = cpuTicks + max<uint64_t>(1, ins.sleepTicks);
@@ -401,7 +442,7 @@ void loadConfig(const string& filename) {
         else if (key == "batch-process-freq") file >> config.batchProcessFreq;
         else if (key == "min-ins") file >> config.minIns;
         else if (key == "max-ins") file >> config.maxIns;
-        else if (key == "delays-per-exec") file >> config.delaysPerExec;
+        else if (key == "delays-per-exec" || key == "delay-per-exec") file >> config.delaysPerExec;
     }
 }
 
@@ -416,7 +457,8 @@ string buildReport() {
 
     out << "CPU utilization: " << (int)utilRate << "%\n";
     out << "Cores used: " << usedCores << "\n";
-    out << "Cores available: " << freeCores << "\n\n";
+    out << "Cores available: " << freeCores << "\n";
+    out << "--------------------------------------\n";
 
     out << "Running processes:\n";
     {
@@ -439,6 +481,7 @@ string buildReport() {
         }
     }
 
+    out << "--------------------------------------\n";
     return out.str();
 }
 
@@ -490,10 +533,12 @@ void printHeader() {
     cout << " / ___/ ___| / _ \\|  _ \\| ____/ ___\\ \\ / /\n";
     cout << "| |   \\___ \\| | | | |_) |  _| \\___ \\\\ V / \n";
     cout << "| |___ ___) | |_| |  __/| |___ ___) || |  \n";
-    cout << " \\____|____/ \\___/|_|   |_____|____/ |_|  \n\n";
+    cout << " \\____|____/ \\___/|_|   |_____|____/ |_|  \n";
+    cout << "--------------------------------------------------\n";
     cout << "Welcome to CSOPESY Emulator!\n\n";
     cout << "Developers:\nRance Laus, Aaron Romero, Ezekiel Tiangson, Luis Vito\n\n";
-    cout << "Last updated: Nov. 05, 2026\n\n";
+    cout << "Last updated: Nov. 05, 2026\n";
+    cout << "--------------------------------------------------\n\n";
     cout << "Type 'initialize' to load config and start the system.\n";
     cout << "Type 'exit' to terminate.\n";
 }
@@ -506,11 +551,16 @@ void cmdInitialize() {
 
     loadConfig("config.txt");
 
-    // Minimum scheduler guards; full config parsing/validation belongs to the CLI work.
+    // Validate config parameters against spec ranges:
+    // num-cpu: [1, 128], scheduler: "fcfs" or "rr"
+    // quantum-cycles, batch-process-freq, min-ins, max-ins: [1, 2^32]
+    // delays-per-exec: [0, 2^32]
     if (config.numCpu < 1 || config.numCpu > 128 ||
         (config.scheduler != "fcfs" && config.scheduler != "rr") ||
-        config.quantumCycles == 0 || config.batchProcessFreq == 0 ||
-        config.minIns == 0 || config.maxIns < config.minIns ||
+        config.quantumCycles < 1 ||
+        config.batchProcessFreq < 1 ||
+        config.minIns < 1 ||
+        config.maxIns < config.minIns ||
         config.maxIns > static_cast<uint32_t>(numeric_limits<int>::max())) {
         cout << "Invalid scheduler configuration; initialization cancelled.\n";
         return;
@@ -618,7 +668,7 @@ void cmdReportUtil() {
     if (file.is_open()) {
         file << buildReport();
         file.close();
-        cout << "Report generated at csopesy-log.txt\n";
+        cout << "Report generated at csopesy-log.txt!\n";
     } else {
         cout << "Failed to write report file.\n";
     }
@@ -670,7 +720,9 @@ int main() {
             cmdInitialize();
         } else if (command == "screen") {
             cmdScreen(input);
-        } else if (command == "scheduler-start") {
+        } else if (command == "screen-ls") {
+            cout << buildReport();
+        } else if (command == "scheduler-start" || command == "scheduler-test") {
             setSchedulerGenerating(true);
             cout << "Dummy process generation started.\n";
         } else if (command == "scheduler-stop") {
